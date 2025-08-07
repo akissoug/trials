@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+POWER MONITOR NODE - STAGE 1: MINIMAL VERSION
+Basic battery monitoring and RTL triggering functionality
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from px4_msgs.msg import BatteryStatus, VehicleStatus, VehicleCommand, VehicleCommandAck
+import time
+from threading import Lock
+
+class PowerMonitorStage1(Node):
+    def __init__(self):
+        super().__init__('power_monitor_stage1')
+
+        # Essential parameters only
+        self.declare_parameter('rtl_battery_remaining', 30.0)  # Trigger RTL at 30%
+        self.declare_parameter('battery_check_interval', 5.0)  # Check every 5 seconds
+        self.declare_parameter('test_mode', True)  # Safe testing mode
+        self.declare_parameter('command_cooldown', 10.0)  # Prevent spam
+
+        # Load parameters
+        self.rtl_battery_remaining = self.get_parameter('rtl_battery_remaining').value
+        self.check_interval = self.get_parameter('battery_check_interval').value
+        self.test_mode = self.get_parameter('test_mode').value
+        self.command_cooldown = self.get_parameter('command_cooldown').value
+
+        # Simple state variables
+        self.battery_status = None
+        self.vehicle_status = None
+        self.rtl_triggered = False
+        self.last_command_time = 0
+        self.lock = Lock()
+        self.start_time = time.time()
+
+        # QoS profile for PX4
+        px4_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE
+        )
+
+        # Publisher for RTL commands
+        self.vehicle_command_pub = self.create_publisher(
+            VehicleCommand,
+            '/fmu/in/vehicle_command',
+            px4_qos_profile
+        )
+
+        # Subscribers
+        self.create_subscription(
+            BatteryStatus, 
+            '/fmu/out/battery_status', 
+            self.battery_callback, 
+            qos_profile=px4_qos_profile
+        )
+        
+        self.create_subscription(
+            VehicleStatus, 
+            '/fmu/out/vehicle_status', 
+            self.status_callback, 
+            qos_profile=px4_qos_profile
+        )
+        
+        self.create_subscription(
+            VehicleCommandAck, 
+            '/fmu/out/vehicle_command_ack', 
+            self.command_ack_callback, 
+            qos_profile=px4_qos_profile
+        )
+
+        # Timer for periodic battery checks
+        self.create_timer(self.check_interval, self.check_battery_status)
+        
+        # Status logging timer
+        self.create_timer(10.0, self.log_status)
+
+        # Startup log
+        self.get_logger().info('🔋 PowerMonitor Stage 1 initialized')
+        self.get_logger().info(f'⚡ RTL trigger: {self.rtl_battery_remaining}% battery')
+        self.get_logger().info(f'🧪 Test mode: {"ENABLED" if self.test_mode else "DISABLED"}')
+
+    def battery_callback(self, msg):
+        """Simple battery status callback"""
+        with self.lock:
+            self.battery_status = msg
+            
+            # Log battery updates (every 10th message to reduce spam)
+            if hasattr(self, '_battery_msg_count'):
+                self._battery_msg_count += 1
+            else:
+                self._battery_msg_count = 1
+                
+            if self._battery_msg_count % 10 == 0:
+                battery_pct = self.get_battery_percentage()
+                if battery_pct is not None:
+                    self.get_logger().info(f'🔋 Battery: {battery_pct:.1f}%, Voltage: {msg.voltage_v:.2f}V')
+
+    def status_callback(self, msg):
+        """Simple vehicle status callback"""
+        with self.lock:
+            previous_arming = None
+            if self.vehicle_status:
+                previous_arming = self.vehicle_status.arming_state
+                
+            self.vehicle_status = msg
+            
+            # Log arming state changes
+            if previous_arming != msg.arming_state:
+                if msg.arming_state == 2:  # ARMED
+                    self.get_logger().info('✈️ Vehicle ARMED')
+                    self.reset_rtl_state()
+                elif msg.arming_state == 1:  # DISARMED
+                    self.get_logger().info('🛑 Vehicle DISARMED')
+                    self.reset_rtl_state()
+
+    def command_ack_callback(self, msg):
+        """Handle command acknowledgments"""
+        with self.lock:
+            if msg.command == VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH:
+                if msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_ACCEPTED:
+                    self.get_logger().info('✅ RTL command ACCEPTED by PX4')
+                    self.rtl_triggered = True
+                elif msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_DENIED:
+                    self.get_logger().warn('❌ RTL command DENIED by PX4')
+                else:
+                    self.get_logger().warn(f'⚠️ RTL command result: {msg.result}')
+
+    def get_battery_percentage(self):
+        """Get battery percentage with simple validation"""
+        if self.battery_status is None:
+            return None
+            
+        if hasattr(self.battery_status, 'remaining'):
+            remaining = self.battery_status.remaining
+            
+            # Handle both 0-1 and 0-100 scales
+            if 0 <= remaining <= 1.0:
+                return remaining * 100.0
+            elif 1.0 < remaining <= 100.0:
+                return remaining
+            else:
+                self.get_logger().warn(f'⚠️ Invalid battery reading: {remaining}')
+                return None
+        return None
+
+    def is_armed(self):
+        """Check if vehicle is armed"""
+        return self.vehicle_status and self.vehicle_status.arming_state == 2
+
+    def get_flight_mode(self):
+        """Get current flight mode"""
+        if not self.vehicle_status:
+            return "UNKNOWN"
+        
+        mode_map = {
+            0: "MANUAL", 1: "ALTITUDE", 2: "POSITION", 3: "AUTO.LOITER",
+            4: "AUTO.MISSION", 5: "AUTO.RTL", 6: "AUTO.LAND", 7: "AUTO.TAKEOFF"
+        }
+        
+        return mode_map.get(self.vehicle_status.nav_state, f"UNKNOWN({self.vehicle_status.nav_state})")
+
+    def send_rtl_command(self):
+        """Send RTL command to PX4"""
+        current_time = time.time()
+        
+        # Check cooldown period
+        if current_time - self.last_command_time < self.command_cooldown:
+            self.get_logger().debug(f'⏰ Command cooldown active')
+            return False
+        
+        if self.test_mode:
+            self.get_logger().warn('🧪 TEST MODE: Would send RTL command (not executed)')
+            return True
+        
+        # Create RTL command
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.command = VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH
+        msg.param1 = 0.0
+        msg.param2 = 0.0
+        msg.param3 = 0.0
+        msg.param4 = 0.0
+        msg.param5 = 0.0
+        msg.param6 = 0.0
+        msg.param7 = 0.0
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        
+        self.vehicle_command_pub.publish(msg)
+        self.last_command_time = current_time
+        
+        self.get_logger().info('📡 RTL command sent to PX4')
+        return True
+
+    def check_battery_status(self):
+        """Main battery monitoring logic"""
+        with self.lock:
+            # Skip if not armed
+            if not self.is_armed():
+                return
+                
+            # Skip if RTL already triggered
+            if self.rtl_triggered:
+                return
+                
+            # Get battery percentage
+            battery_percentage = self.get_battery_percentage()
+            if battery_percentage is None:
+                return
+            
+            # Check if battery is below threshold
+            if battery_percentage <= self.rtl_battery_remaining:
+                current_mode = self.get_flight_mode()
+                
+                # Don't trigger RTL if already in RTL mode
+                if current_mode == "AUTO.RTL":
+                    return
+                    
+                self.get_logger().warn(f'🚨 LOW BATTERY: {battery_percentage:.1f}% <= {self.rtl_battery_remaining}%')
+                self.get_logger().warn(f'🚨 Triggering RTL from mode: {current_mode}')
+                
+                if self.send_rtl_command():
+                    self.get_logger().info('✅ RTL triggered due to low battery')
+
+    def log_status(self):
+        """Log current status periodically"""
+        if not self.is_armed():
+            return
+            
+        battery_pct = self.get_battery_percentage()
+        flight_time = time.time() - self.start_time if self.is_armed() else 0
+        current_mode = self.get_flight_mode()
+        
+        status_msg = f'📊 Status: Mode={current_mode}, Battery={battery_pct:.1f}%, '
+        status_msg += f'Flight={flight_time:.0f}s, RTL_Triggered={self.rtl_triggered}'
+        
+        self.get_logger().info(status_msg)
+
+    def reset_rtl_state(self):
+        """Reset RTL state"""
+        if self.rtl_triggered:
+            self.get_logger().info('🔄 Resetting RTL state')
+        self.rtl_triggered = False
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PowerMonitorStage1()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('🛑 PowerMonitor Stage 1 shutdown')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
