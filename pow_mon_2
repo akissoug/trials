@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+POWER MONITOR NODE - STAGE 2 (INTERMEDIATE VERSION)
+Test Focus: Grace periods and distance calculations
+- All Stage 1 features
+- Mission start grace period
+- Minimum flight time before RTL
+- Home position tracking
+- Distance to home calculation
+- Battery percentage validation
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from px4_msgs.msg import BatteryStatus, VehicleStatus, VehicleCommand, VehicleCommandAck, VehicleGlobalPosition
+from threading import Lock
+import time
+import math
+
+class PowerMonitorStage2(Node):
+    def __init__(self):
+        super().__init__('power_monitor_stage2')
+        
+        # Stage 2 Parameters - Added grace periods and distance
+        self.declare_parameter('rtl_battery_remaining', 30.0)
+        self.declare_parameter('battery_check_interval', 2.0)
+        self.declare_parameter('mission_start_grace_period', 20.0)  # NEW: No RTL for 20s after mission start
+        self.declare_parameter('min_flight_time_before_rtl', 15.0)  # NEW: No RTL for first 15s of flight
+        self.declare_parameter('home_position_timeout', 30.0)  # NEW: Wait for home position
+        self.declare_parameter('sitl_mode', True)
+        self.declare_parameter('enable_rtl_trigger', True)
+        
+        # Get parameters
+        self.rtl_battery_remaining = self.get_parameter('rtl_battery_remaining').value
+        self.check_interval = self.get_parameter('battery_check_interval').value
+        self.mission_start_grace = self.get_parameter('mission_start_grace_period').value
+        self.min_flight_time = self.get_parameter('min_flight_time_before_rtl').value
+        self.home_timeout = self.get_parameter('home_position_timeout').value
+        self.sitl_mode = self.get_parameter('sitl_mode').value
+        self.enable_rtl = self.get_parameter('enable_rtl_trigger').value
+        
+        # State variables
+        self.battery_status = None
+        self.vehicle_status = None
+        self.global_position = None  # NEW
+        self.home_position = None  # NEW
+        self.rtl_triggered = False
+        self.lock = Lock()
+        self.node_start_time = time.time()
+        self.mission_start_time = None  # NEW
+        self.armed_time = None  # NEW
+        self.last_battery_log_time = 0
+        self.battery_percentage = None
+        self.last_valid_battery = None  # NEW: Track last valid reading
+        
+        # Command tracking
+        self.last_command_time = 0
+        self.pending_rtl_command = False
+        
+        # Define QoS profile for PX4
+        px4_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE
+        )
+        
+        # Publishers
+        self.vehicle_command_pub = self.create_publisher(
+            VehicleCommand,
+            '/fmu/in/vehicle_command',
+            px4_qos_profile
+        )
+        
+        # Subscribers
+        self.create_subscription(
+            BatteryStatus, 
+            '/fmu/out/battery_status', 
+            self.battery_callback, 
+            qos_profile=px4_qos_profile
+        )
+        
+        self.create_subscription(
+            VehicleStatus, 
+            '/fmu/out/vehicle_status', 
+            self.status_callback, 
+            qos_profile=px4_qos_profile
+        )
+        
+        self.create_subscription(
+            VehicleCommandAck, 
+            '/fmu/out/vehicle_command_ack', 
+            self.command_ack_callback, 
+            qos_profile=px4_qos_profile
+        )
+        
+        # NEW: GPS subscriber for home position and distance
+        self.create_subscription(
+            VehicleGlobalPosition,
+            '/fmu/out/vehicle_global_position',
+            self.gps_callback,
+            qos_profile=px4_qos_profile
+        )
+        
+        # Timer for periodic battery check
+        self.create_timer(self.check_interval, self.check_battery_status)
+        
+        # Startup message
+        self.get_logger().info('='*50)
+        self.get_logger().info('POWER MONITOR STAGE 2 - WITH GRACE PERIODS')
+        self.get_logger().info(f'RTL Battery Threshold: {self.rtl_battery_remaining:.1f}%')
+        self.get_logger().info(f'Mission Start Grace: {self.mission_start_grace}s')
+        self.get_logger().info(f'Min Flight Time: {self.min_flight_time}s')
+        self.get_logger().info(f'Check Interval: {self.check_interval}s')
+        self.get_logger().info('='*50)
+    
+    def battery_callback(self, msg):
+        """Process battery status messages with validation"""
+        with self.lock:
+            self.battery_status = msg
+            
+            # Get battery percentage with validation
+            if hasattr(msg, 'remaining'):
+                new_percentage = None
+                
+                # Handle both 0-1 and 0-100 scales
+                if 0 <= msg.remaining <= 1.0:
+                    new_percentage = msg.remaining * 100.0
+                elif 1.0 < msg.remaining <= 100.0:
+                    new_percentage = msg.remaining
+                
+                # Validate the reading
+                if new_percentage is not None and 0 <= new_percentage <= 100:
+                    self.battery_percentage = new_percentage
+                    self.last_valid_battery = new_percentage
+                elif self.last_valid_battery is not None:
+                    # Use last valid reading if current is invalid
+                    self.battery_percentage = self.last_valid_battery
+                    self.get_logger().warn(f'Invalid battery: {msg.remaining}, using last valid: {self.last_valid_battery:.1f}%')
+                
+                # Log battery every 10 seconds
+                current_time = time.time()
+                if current_time - self.last_battery_log_time > 10.0 and self.battery_percentage:
+                    self.get_logger().info(f'📊 Battery: {self.battery_percentage:.1f}%')
+                    self.last_battery_log_time = current_time
+    
+    def gps_callback(self, msg):
+        """NEW: Process GPS for home position and distance calculation"""
+        with self.lock:
+            self.global_position = msg
+            
+            # Set home position on first valid GPS after arming
+            if (self.home_position is None and 
+                self.is_armed() and
+                msg.lat != 0 and msg.lon != 0):
+                
+                self.home_position = (msg.lat, msg.lon, msg.alt)
+                self.get_logger().info(f'🏠 Home position set: lat={msg.lat:.6f}, lon={msg.lon:.6f}, alt={msg.alt:.2f}m')
+    
+    def status_callback(self, msg):
+        """Process vehicle status with mission/armed tracking"""
+        with self.lock:
+            previous_mode = self.get_current_mode() if self.vehicle_status else None
+            previous_arming = self.vehicle_status.arming_state if self.vehicle_status else None
+            
+            self.vehicle_status = msg
+            current_mode = self.get_current_mode()
+            
+            # Track arming for flight time
+            if previous_arming != msg.arming_state:
+                if msg.arming_state == 2:  # ARMED
+                    self.armed_time = time.time()
+                    self.get_logger().info('✈️ Vehicle ARMED')
+                elif msg.arming_state == 1:  # DISARMED
+                    self.armed_time = None
+                    self.mission_start_time = None
+                    self.home_position = None  # Reset home on disarm
+                    self.rtl_triggered = False  # Reset for next flight
+                    self.get_logger().info('🛑 Vehicle DISARMED')
+            
+            # Track mission start for grace period
+            if previous_mode != current_mode:
+                self.get_logger().info(f'✈️ Mode changed: {previous_mode} → {current_mode}')
+                
+                # Detect mission start
+                if current_mode in ['AUTO.MISSION', 'AUTO.TAKEOFF'] and previous_mode not in ['AUTO.MISSION', 'AUTO.TAKEOFF']:
+                    self.mission_start_time = time.time()
+                    self.get_logger().info(f'🚀 Mission started - Grace period active for {self.mission_start_grace}s')
+                
+                # Check if RTL completed
+                if previous_mode == 'AUTO.RTL' and current_mode != 'AUTO.RTL':
+                    self.get_logger().info('✅ RTL completed')
+                    self.rtl_triggered = False
+    
+    def command_ack_callback(self, msg):
+        """Process command acknowledgments"""
+        with self.lock:
+            if self.pending_rtl_command:
+                if msg.command == VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH:
+                    if msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_ACCEPTED:
+                        self.get_logger().info('✅ RTL command ACCEPTED by PX4')
+                        self.rtl_triggered = True
+                        self.pending_rtl_command = False
+                    elif msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED:
+                        self.get_logger().warn('⏳ RTL command TEMPORARILY REJECTED')
+                        self.pending_rtl_command = False
+                    else:
+                        self.get_logger().error(f'❌ RTL command FAILED: result={msg.result}')
+                        self.pending_rtl_command = False
+    
+    def get_current_mode(self):
+        """Get current flight mode"""
+        if not self.vehicle_status:
+            return "UNKNOWN"
+        
+        mode_map = {
+            0: "MANUAL", 1: "ALTITUDE", 2: "POSITION", 3: "AUTO.LOITER",
+            4: "AUTO.MISSION", 5: "AUTO.RTL", 6: "AUTO.LAND", 7: "AUTO.TAKEOFF",
+            8: "OFFBOARD", 9: "STABILIZED", 10: "ACRO"
+        }
+        
+        return mode_map.get(self.vehicle_status.nav_state, f"MODE_{self.vehicle_status.nav_state}")
+    
+    def is_armed(self):
+        """Check if vehicle is armed"""
+        if self.vehicle_status:
+            return self.vehicle_status.arming_state == 2
+        return False
+    
+    def get_flight_time(self):
+        """NEW: Get time since arming"""
+        if self.armed_time is None:
+            return 0
+        return time.time() - self.armed_time
+    
+    def is_in_grace_period(self):
+        """NEW: Check if we're in any grace period"""
+        current_time = time.time()
+        
+        # Mission start grace period
+        if self.mission_start_time is not None:
+            time_since_mission = current_time - self.mission_start_time
+            if time_since_mission < self.mission_start_grace:
+                remaining = self.mission_start_grace - time_since_mission
+                self.get_logger().info(f'⏳ Mission grace period: {remaining:.1f}s remaining')
+                return True
+        
+        # Minimum flight time grace period
+        flight_time = self.get_flight_time()
+        if flight_time > 0 and flight_time < self.min_flight_time:
+            remaining = self.min_flight_time - flight_time
+            self.get_logger().info(f'⏳ Min flight time: {remaining:.1f}s remaining')
+            return True
+            
+        return False
+    
+    def calculate_distance_to_home(self):
+        """NEW: Calculate distance to home position"""
+        if self.home_position is None or self.global_position is None:
+            return None
+        
+        # Haversine formula for distance
+        lat1, lon1, alt1 = self.home_position
+        lat2 = self.global_position.lat
+        lon2 = self.global_position.lon
+        alt2 = self.global_position.alt
+        
+        R = 6371000  # Earth radius in meters
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        
+        a = math.sin(delta_phi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        
+        horizontal_distance = R * c
+        vertical_distance = abs(alt2 - alt1)
+        
+        # Total distance with altitude consideration
+        total_distance = math.sqrt(horizontal_distance**2 + vertical_distance**2)
+        
+        return total_distance
+    
+    def send_rtl_command(self):
+        """Send RTL command to PX4"""
+        self.get_logger().warn('🚨 SENDING RTL COMMAND')
+        
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.command = VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH
+        msg.param1 = 0.0
+        msg.param2 = 0.0
+        msg.param3 = 0.0
+        msg.param4 = 0.0
+        msg.param5 = 0.0
+        msg.param6 = 0.0
+        msg.param7 = 0.0
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        
+        self.vehicle_command_pub.publish(msg)
+        self.pending_rtl_command = True
+        self.last_command_time = time.time()
+    
+    def check_battery_status(self):
+        """Main battery checking logic - Stage 2 with grace periods"""
+        with self.lock:
+            # Skip if not armed
+            if not self.is_armed():
+                return
+            
+            # Skip if RTL already triggered
+            if self.rtl_triggered:
+                return
+            
+            # NEW: Skip if in grace period
+            if self.is_in_grace_period():
+                return
+            
+            # Skip if already in RTL or LAND mode
+            current_mode = self.get_current_mode()
+            if current_mode in ['AUTO.RTL', 'AUTO.LAND', 'MANUAL']:
+                return
+            
+            # Check battery
+            if self.battery_percentage is None:
+                return
+            
+            # NEW: Check home position
+            if self.home_position is None:
+                elapsed = time.time() - self.node_start_time
+                if elapsed > self.home_timeout:
+                    self.get_logger().warn(f'⚠️ No home position after {self.home_timeout}s')
+                return
+            
+            # Calculate distance to home
+            distance = self.calculate_distance_to_home()
+            distance_str = f'{distance:.1f}m' if distance else 'N/A'
+            
+            # Log current status with distance
+            self.get_logger().info(
+                f'🔋 Battery: {self.battery_percentage:.1f}% | '
+                f'Threshold: {self.rtl_battery_remaining:.1f}% | '
+                f'Distance: {distance_str} | '
+                f'Mode: {current_mode} | '
+                f'Flight time: {self.get_flight_time():.0f}s'
+            )
+            
+            # Check if battery is below threshold
+            if self.battery_percentage <= self.rtl_battery_remaining:
+                self.get_logger().warn(
+                    f'⚠️ BATTERY LOW: {self.battery_percentage:.1f}% <= {self.rtl_battery_remaining:.1f}%'
+                )
+                
+                if self.enable_rtl:
+                    self.send_rtl_command()
+                else:
+                    self.get_logger().info('RTL trigger disabled for testing')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PowerMonitorStage2()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('Shutting down Power Monitor Stage 2')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
