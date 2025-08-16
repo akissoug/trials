@@ -43,7 +43,7 @@ class PowerMonitorFinal(Node):
         
         # WIG Effect Parameters (for logging only)
         self.declare_parameter('wing_span', 5.5)  # Aircraft wingspan in meters
-        self.declare_parameter('wig_height_threshold', 15.0)  # Track WIG below h/b = 2.7 (15m for 5.5m span)
+        self.declare_parameter('wig_height_threshold', 11.0)  # Track WIG below h/b = 2.0 (11m for 5.5m span)
         self.declare_parameter('min_safe_altitude', 1.5)  # Minimum safe altitude
         
         self.declare_parameter('sitl_mode', True)
@@ -418,7 +418,7 @@ class PowerMonitorFinal(Node):
         horizontal = R * c
         vertical = abs(alt2 - alt1) * 0.3  # Reduced weight for fixed-wing
         
-        return horizontal + vertical
+        return horizontal + 0.5*vertical
     
     def get_average_current(self):
         """Get average current draw"""
