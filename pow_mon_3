@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-POWER MONITOR NODE - STAGE 3 FINAL (COMPLETE PRODUCTION VERSION)
+POWER MONITOR NODE - STAGE 3 FINAL (CLEAN VERSION WITH REALISTIC WIG MODEL)
 Full-featured power monitor for fixed-wing aircraft with WIG effect awareness
-- All Stage 1 & 2 features
-- Current monitoring and averaging
-- Time remaining calculations
-- Return time estimation with safety margin
-- WIG effect detection and efficiency tracking
-- Loiter radius consideration
-- Command retry logic
-- State reset mechanisms
-- Production logging
+- WIG effect based on h/b ratio (height/wingspan)
+- WIG for logging only, not battery calculations
+- Realistic hyperbolic efficiency model
+- Conservative battery calculations for safety
 """
 
 import rclpy
@@ -35,7 +30,7 @@ class PowerMonitorFinal(Node):
         self.declare_parameter('min_flight_time_before_rtl', 20.0)
         self.declare_parameter('home_position_timeout', 30.0)
         
-        # NEW: Advanced parameters
+        # Advanced parameters
         self.declare_parameter('safety_margin', 0.4)  # 40% safety margin for return
         self.declare_parameter('average_return_speed', 15.0)  # m/s cruise speed
         self.declare_parameter('battery_capacity_mah', 5000.0)
@@ -46,9 +41,9 @@ class PowerMonitorFinal(Node):
         self.declare_parameter('command_cooldown', 5.0)
         self.declare_parameter('max_command_retries', 3)
         
-        # WIG Effect Parameters
-        self.declare_parameter('wig_effect_altitude', 10.0)  # WIG effect below 10m
-        self.declare_parameter('wig_efficiency_gain', 0.15)  # 15% efficiency in WIG
+        # WIG Effect Parameters (for logging only)
+        self.declare_parameter('wing_span', 5.5)  # Aircraft wingspan in meters
+        self.declare_parameter('wig_height_threshold', 15.0)  # Track WIG below h/b = 2.7 (15m for 5.5m span)
         self.declare_parameter('min_safe_altitude', 2.0)  # Minimum safe altitude
         
         self.declare_parameter('sitl_mode', True)
@@ -69,8 +64,8 @@ class PowerMonitorFinal(Node):
         self.rtl_reset_timeout = self.get_parameter('rtl_reset_timeout').value
         self.command_cooldown = self.get_parameter('command_cooldown').value
         self.max_retries = self.get_parameter('max_command_retries').value
-        self.wig_altitude = self.get_parameter('wig_effect_altitude').value
-        self.wig_efficiency = self.get_parameter('wig_efficiency_gain').value
+        self.wing_span = self.get_parameter('wing_span').value
+        self.wig_height_threshold = self.get_parameter('wig_height_threshold').value
         self.min_safe_alt = self.get_parameter('min_safe_altitude').value
         self.sitl_mode = self.get_parameter('sitl_mode').value
         self.enable_rtl = self.get_parameter('enable_rtl_trigger').value
@@ -100,11 +95,13 @@ class PowerMonitorFinal(Node):
         self.pending_rtl_command = False
         self.command_retry_count = 0
         
-        # WIG effect tracking
+        # WIG effect tracking (for logging only)
         self.in_wig_effect = False
         self.wig_time_total = 0
         self.wig_time_start = None
-        self.efficiency_factor = 1.0
+        self.wig_efficiency_log = []  # Store efficiency values for analysis
+        self.current_h_over_b = None  # Current h/b ratio
+        self.current_wig_efficiency = 0.0  # Current efficiency gain
         
         # Mode tracking for debugging
         self.mode_history = deque(maxlen=10)
@@ -125,7 +122,7 @@ class PowerMonitorFinal(Node):
             px4_qos_profile
         )
         
-        # NEW: Status publisher for monitoring
+        # Status publisher for monitoring
         self.status_pub = self.create_publisher(
             String,
             '/power_monitor/status',
@@ -161,14 +158,49 @@ class PowerMonitorFinal(Node):
         self.get_logger().info(f'  • Return Speed: {self.return_speed:.1f} m/s')
         self.get_logger().info(f'  • Safety Margin: {self.safety_margin*100:.0f}%')
         self.get_logger().info(f'  • Loiter Radius: {self.loiter_radius:.0f}m')
-        self.get_logger().info(f'🌊 WIG Effect Parameters:')
-        self.get_logger().info(f'  • WIG Altitude: < {self.wig_altitude:.1f}m')
-        self.get_logger().info(f'  • Efficiency Gain: {self.wig_efficiency*100:.0f}%')
+        self.get_logger().info(f'🌊 WIG Effect Parameters (Logging Only):')
+        self.get_logger().info(f'  • Wing Span: {self.wing_span:.1f}m')
+        self.get_logger().info(f'  • WIG Tracking Below: {self.wig_height_threshold:.1f}m (h/b < {self.wig_height_threshold/self.wing_span:.1f})')
         self.get_logger().info(f'  • Min Safe Altitude: {self.min_safe_alt:.1f}m')
+        self.get_logger().info(f'  • Model: Hyperbolic efficiency based on h/b ratio')
         self.get_logger().info(f'⏱️ Grace Periods:')
         self.get_logger().info(f'  • Mission Start: {self.mission_start_grace:.0f}s')
         self.get_logger().info(f'  • Min Flight Time: {self.min_flight_time:.0f}s')
+        self.get_logger().info(f'⚠️ Note: WIG effect for information only - not used in RTL calculations')
         self.get_logger().info('='*60)
+    
+    def calculate_wig_efficiency(self, altitude_agl):
+        """
+        Calculate WIG efficiency based on realistic hyperbolic model
+        Efficiency = K / (1 + (h/b)^n) where:
+        - h = height above ground
+        - b = wing span
+        - K = maximum efficiency gain (typically 0.3-0.4 at h/b ≈ 0.1)
+        - n = decay exponent (typically 2-3)
+        
+        This is for LOGGING ONLY - not used in battery calculations
+        """
+        if altitude_agl is None or altitude_agl < 0:
+            return 0.0
+        
+        h_over_b = altitude_agl / self.wing_span
+        
+        # Hyperbolic model parameters (tuned for realistic WIG effect)
+        K = 0.35  # Maximum 35% efficiency gain at very low altitude
+        n = 2.5   # Decay exponent
+        
+        # Calculate efficiency gain
+        if h_over_b < 3.0:  # Only significant below h/b = 3
+            efficiency_gain = K / (1 + (h_over_b ** n))
+            
+            # Apply safety limits
+            if altitude_agl < self.min_safe_alt:
+                # Too low - dangerous zone
+                efficiency_gain *= 0.5  # Reduced efficiency due to safety concerns
+                
+            return efficiency_gain
+        else:
+            return 0.0
     
     def battery_callback(self, msg):
         """Process battery with current monitoring"""
@@ -196,7 +228,7 @@ class PowerMonitorFinal(Node):
                 self.current_history.append(current)
     
     def gps_callback(self, msg):
-        """Process GPS with WIG effect detection"""
+        """Process GPS with WIG effect detection (for logging only)"""
         with self.lock:
             self.global_position = msg
             
@@ -208,26 +240,45 @@ class PowerMonitorFinal(Node):
                 self.home_position = (msg.lat, msg.lon, msg.alt)
                 self.get_logger().info(f'🏠 Home position set: lat={msg.lat:.6f}, lon={msg.lon:.6f}, alt={msg.alt:.2f}m')
             
-            # WIG effect detection based on altitude
+            # WIG effect detection for logging
             if self.is_armed() and hasattr(msg, 'alt'):
                 altitude_agl = self.get_altitude_agl()
                 
                 if altitude_agl is not None:
-                    was_in_wig = self.in_wig_effect
-                    self.in_wig_effect = (altitude_agl <= self.wig_altitude and 
-                                         altitude_agl >= self.min_safe_alt)
+                    # Calculate h/b ratio
+                    self.current_h_over_b = altitude_agl / self.wing_span
                     
-                    # Track WIG time
+                    # Calculate efficiency (for logging only)
+                    self.current_wig_efficiency = self.calculate_wig_efficiency(altitude_agl)
+                    
+                    # Track WIG zone entry/exit
+                    was_in_wig = self.in_wig_effect
+                    self.in_wig_effect = (altitude_agl <= self.wig_height_threshold and 
+                                         altitude_agl >= self.min_safe_alt and
+                                         self.current_wig_efficiency > 0.05)  # At least 5% efficiency
+                    
+                    # Log WIG transitions
                     if self.in_wig_effect and not was_in_wig:
                         self.wig_time_start = time.time()
-                        self.get_logger().info(f'🌊 Entered WIG effect zone (alt: {altitude_agl:.1f}m)')
+                        self.get_logger().info(
+                            f'🌊 Entered WIG effect zone - Alt: {altitude_agl:.1f}m, '
+                            f'h/b: {self.current_h_over_b:.2f}, '
+                            f'Efficiency: +{self.current_wig_efficiency*100:.1f}% (INFO ONLY)'
+                        )
                     elif not self.in_wig_effect and was_in_wig:
                         if self.wig_time_start:
-                            self.wig_time_total += time.time() - self.wig_time_start
-                        self.get_logger().info(f'☁️ Exited WIG effect zone (alt: {altitude_agl:.1f}m)')
+                            session_time = time.time() - self.wig_time_start
+                            self.wig_time_total += session_time
+                            avg_efficiency = sum(self.wig_efficiency_log) / len(self.wig_efficiency_log) if self.wig_efficiency_log else 0
+                            self.get_logger().info(
+                                f'☁️ Exited WIG effect zone - Session: {session_time:.1f}s, '
+                                f'Avg efficiency: +{avg_efficiency*100:.1f}% (INFO ONLY)'
+                            )
+                        self.wig_efficiency_log = []
                     
-                    # Update efficiency factor
-                    self.efficiency_factor = 1.0 + self.wig_efficiency if self.in_wig_effect else 1.0
+                    # Log efficiency periodically while in WIG
+                    if self.in_wig_effect:
+                        self.wig_efficiency_log.append(self.current_wig_efficiency)
     
     def status_callback(self, msg):
         """Process vehicle status with complete state tracking"""
@@ -283,7 +334,6 @@ class PowerMonitorFinal(Node):
                     elif msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED:
                         self.get_logger().warn(f'⏳ RTL command TEMPORARILY REJECTED (retry {self.command_retry_count}/{self.max_retries})')
                         self.pending_rtl_command = False
-                        # Will retry on next check
                     else:
                         self.get_logger().error(f'❌ RTL command FAILED: result={msg.result}')
                         self.command_retry_count += 1
@@ -381,7 +431,10 @@ class PowerMonitorFinal(Node):
         return sum(self.current_history) / len(self.current_history)
     
     def calculate_remaining_time(self):
-        """Calculate battery time remaining with WIG efficiency"""
+        """
+        Calculate battery time remaining - CONSERVATIVE, no WIG efficiency
+        This is used for RTL decisions, so we don't include WIG gains for safety
+        """
         if self.battery_percentage is None:
             return None
         
@@ -389,15 +442,13 @@ class PowerMonitorFinal(Node):
         if avg_current is None or avg_current < self.min_current:
             return None
         
-        # Adjust for WIG efficiency
-        effective_current = avg_current / self.efficiency_factor
-        
+        # Use actual current WITHOUT any efficiency gains (conservative)
         capacity = self.battery_capacity
         if hasattr(self.battery_status, 'capacity') and self.battery_status.capacity > 0:
             capacity = self.battery_status.capacity
         
         remaining_mah = (self.battery_percentage / 100.0) * capacity
-        current_draw_ma = effective_current * 1000.0
+        current_draw_ma = avg_current * 1000.0
         
         if current_draw_ma > 0:
             time_hours = remaining_mah / current_draw_ma
@@ -455,15 +506,24 @@ class PowerMonitorFinal(Node):
         self.armed_time = time.time()
         self.reset_rtl_state("Vehicle armed")
         self.wig_time_total = 0
+        self.wig_efficiency_log = []
         self.get_logger().info('✈️ Vehicle ARMED - Power monitor active')
     
     def handle_disarm(self):
         """Handle disarm event"""
-        # Log WIG statistics
+        # Log WIG statistics (informational only)
         if self.wig_time_total > 0:
-            self.get_logger().info(f'🌊 WIG Effect Summary: {self.wig_time_total:.1f}s total')
-            efficiency_saved = self.wig_time_total * self.wig_efficiency
-            self.get_logger().info(f'💡 Estimated efficiency gain: {efficiency_saved:.1f}s flight time')
+            self.get_logger().info('='*50)
+            self.get_logger().info('🌊 WIG Effect Flight Summary (Informational):')
+            self.get_logger().info(f'  • Total time in WIG: {self.wig_time_total:.1f}s')
+            flight_time = self.get_flight_time()
+            if flight_time > 0:
+                self.get_logger().info(f'  • Percentage of flight: {(self.wig_time_total/flight_time)*100:.1f}%')
+            if self.wig_efficiency_log:
+                avg_eff = sum(self.wig_efficiency_log) / len(self.wig_efficiency_log)
+                self.get_logger().info(f'  • Average efficiency gain: +{avg_eff*100:.1f}%')
+            self.get_logger().info(f'  • Note: WIG efficiency NOT used in RTL calculations')
+            self.get_logger().info('='*50)
         
         self.armed_time = None
         self.mission_start_time = None
@@ -510,7 +570,9 @@ class PowerMonitorFinal(Node):
                 'rtl_triggered': self.rtl_triggered,
                 'in_wig_effect': self.in_wig_effect,
                 'altitude_agl': self.get_altitude_agl(),
-                'efficiency_factor': self.efficiency_factor,
+                'h_over_b': self.current_h_over_b,
+                'wig_efficiency_info': self.current_wig_efficiency,  # For info only
+                'wig_time_total': self.wig_time_total,
                 'flight_time': self.get_flight_time()
             }
             
@@ -519,7 +581,7 @@ class PowerMonitorFinal(Node):
             self.status_pub.publish(msg)
     
     def check_battery_status(self):
-        """Main battery checking logic - Complete version"""
+        """Main battery checking logic - Conservative, no WIG in calculations"""
         with self.lock:
             # Skip if not armed
             if not self.is_armed():
@@ -562,9 +624,9 @@ class PowerMonitorFinal(Node):
                     self.get_logger().warn(f'⚠️ No home position after {self.home_timeout}s')
                 return
             
-            # Calculate all metrics
+            # Calculate all metrics (conservative, no WIG efficiency)
             distance = self.calculate_distance_to_home()
-            remaining_time = self.calculate_remaining_time()
+            remaining_time = self.calculate_remaining_time()  # No WIG efficiency
             return_time = self.calculate_return_time()
             altitude = self.get_altitude_agl()
             avg_current = self.get_average_current()
@@ -587,14 +649,15 @@ class PowerMonitorFinal(Node):
             if altitude:
                 log_parts.append(f'📏 Alt: {altitude:.1f}m')
                 if self.in_wig_effect:
-                    log_parts.append('🌊 WIG ACTIVE')
+                    # Show WIG info but clarify it's not used in calculations
+                    log_parts.append(f'🌊 WIG: h/b={self.current_h_over_b:.2f} (+{self.current_wig_efficiency*100:.0f}% info)')
             
             if avg_current:
                 log_parts.append(f'⚡ Current: {avg_current:.1f}A')
             
             self.get_logger().info(' | '.join(log_parts))
             
-            # Check RTL conditions
+            # Check RTL conditions (CONSERVATIVE - no WIG efficiency)
             should_rtl = False
             reason = ""
             
@@ -603,7 +666,7 @@ class PowerMonitorFinal(Node):
                 should_rtl = True
                 reason = f"battery at threshold ({self.battery_percentage:.1f}% ≤ {self.rtl_battery_remaining:.1f}%)"
             
-            # Time remaining check
+            # Time remaining check (conservative, no WIG bonus)
             elif remaining_time and return_time and remaining_time < return_time:
                 should_rtl = True
                 reason = f"insufficient time ({remaining_time/60:.1f}min < {return_time/60:.1f}min needed)"
