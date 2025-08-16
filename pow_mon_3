@@ -190,13 +190,9 @@ class PowerMonitorFinal(Node):
         n = 2.5   # Decay exponent
         
         # Calculate efficiency gain
-        if h_over_b < 3.0:  # Only significant below h/b = 3
+        if h_over_b < 5.0: 
             efficiency_gain = K / (1 + (h_over_b ** n))
             
-            # Apply safety limits
-            if altitude_agl < self.min_safe_alt:
-                # Too low - dangerous zone
-                efficiency_gain *= 0.5  # Reduced efficiency due to safety concerns
                 
             return efficiency_gain
         else:
