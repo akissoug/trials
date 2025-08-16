@@ -33,10 +33,10 @@ class PowerMonitorFinal(Node):
         # Advanced parameters
         self.declare_parameter('safety_margin', 0.4)  # 40% safety margin for return
         self.declare_parameter('average_return_speed', 15.0)  # m/s cruise speed
-        self.declare_parameter('battery_capacity_mah', 5000.0)
+        self.declare_parameter('battery_capacity_mah', 10000.0)
         self.declare_parameter('min_current_threshold', 0.1)
         self.declare_parameter('current_averaging_window', 10)
-        self.declare_parameter('loiter_radius', 100.0)  # Fixed-wing loiter radius
+        self.declare_parameter('loiter_radius', 80.0)  # Fixed-wing loiter radius
         self.declare_parameter('rtl_reset_timeout', 60.0)
         self.declare_parameter('command_cooldown', 5.0)
         self.declare_parameter('max_command_retries', 3)
@@ -44,7 +44,7 @@ class PowerMonitorFinal(Node):
         # WIG Effect Parameters (for logging only)
         self.declare_parameter('wing_span', 5.5)  # Aircraft wingspan in meters
         self.declare_parameter('wig_height_threshold', 15.0)  # Track WIG below h/b = 2.7 (15m for 5.5m span)
-        self.declare_parameter('min_safe_altitude', 2.0)  # Minimum safe altitude
+        self.declare_parameter('min_safe_altitude', 1.5)  # Minimum safe altitude
         
         self.declare_parameter('sitl_mode', True)
         self.declare_parameter('enable_rtl_trigger', True)
@@ -190,7 +190,7 @@ class PowerMonitorFinal(Node):
         n = 2.5   # Decay exponent
         
         # Calculate efficiency gain
-        if h_over_b < 5.0: 
+        if h_over_b < 2.0: 
             efficiency_gain = K / (1 + (h_over_b ** n))
             
                 
