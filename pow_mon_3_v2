@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""
+POWER MONITOR NODE - SIMPLIFIED WITH CURRENT INTEGRATION
+Full-featured power monitor for fixed-wing aircraft with WIG effect awareness
+- Current integration for accurate battery tracking
+- Smart multi-mission battery continuity
+- Simple configuration with minimal parameters
+- Conservative battery calculations for safety
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from px4_msgs.msg import BatteryStatus, VehicleStatus, VehicleCommand, VehicleCommandAck, VehicleGlobalPosition
+from std_msgs.msg import String
+from threading import Lock
+from collections import deque
+import time
+import math
+import json
+
+class PowerMonitorFinal(Node):
+    def __init__(self):
+        super().__init__('power_monitor_final')
+        
+        # Complete Parameters Set
+        self.declare_parameter('rtl_battery_remaining', 30.0)
+        self.declare_parameter('battery_check_interval', 5.0)
+        self.declare_parameter('mission_start_grace_period', 30.0)
+        self.declare_parameter('min_flight_time_before_rtl', 20.0)
+        self.declare_parameter('home_position_timeout', 30.0)
+        
+        # Advanced parameters
+        self.declare_parameter('safety_margin', 0.4)  # 40% safety margin for return
+        self.declare_parameter('average_return_speed', 15.0)  # m/s cruise speed
+        self.declare_parameter('battery_capacity_mah', 10000.0)
+        self.declare_parameter('min_current_threshold', 0.1)
+        self.declare_parameter('current_averaging_window', 10)
+        self.declare_parameter('loiter_radius', 80.0)  # Fixed-wing loiter radius
+        self.declare_parameter('rtl_reset_timeout', 60.0)
+        self.declare_parameter('command_cooldown', 5.0)
+        self.declare_parameter('max_command_retries', 3)
+        
+        # Simplified battery strategy parameters  
+        self.declare_parameter('battery_strategy', 'integration')  # 'px4', 'integration', or 'auto'
+        self.declare_parameter('reset_after_hours', 2.0)  # Reset integration after X hours disarmed
+        self.declare_parameter('always_reset_battery', False)  # Always reset to 100% on arm
+        
+        # WIG Effect Parameters (for logging only)
+        self.declare_parameter('wing_span', 5.5)  # Aircraft wingspan in meters
+        self.declare_parameter('wig_height_threshold', 11.0)  # Track WIG below h/b = 2.0 (11m for 5.5m span)
+        self.declare_parameter('min_safe_altitude', 1.5)  # Minimum safe altitude
+        
+        self.declare_parameter('sitl_mode', True)
+        self.declare_parameter('enable_rtl_trigger', True)
+        
+        # Get all parameters
+        self.rtl_battery_remaining = self.get_parameter('rtl_battery_remaining').value
+        self.check_interval = self.get_parameter('battery_check_interval').value
+        self.mission_start_grace = self.get_parameter('mission_start_grace_period').value
+        self.min_flight_time = self.get_parameter('min_flight_time_before_rtl').value
+        self.home_timeout = self.get_parameter('home_position_timeout').value
+        self.safety_margin = self.get_parameter('safety_margin').value
+        self.return_speed = self.get_parameter('average_return_speed').value
+        self.battery_capacity = self.get_parameter('battery_capacity_mah').value
+        self.min_current = self.get_parameter('min_current_threshold').value
+        self.current_window_size = self.get_parameter('current_averaging_window').value
+        self.loiter_radius = self.get_parameter('loiter_radius').value
+        self.rtl_reset_timeout = self.get_parameter('rtl_reset_timeout').value
+        self.command_cooldown = self.get_parameter('command_cooldown').value
+        self.max_retries = self.get_parameter('max_command_retries').value
+        self.wing_span = self.get_parameter('wing_span').value
+        self.wig_height_threshold = self.get_parameter('wig_height_threshold').value
+        self.min_safe_alt = self.get_parameter('min_safe_altitude').value
+        self.sitl_mode = self.get_parameter('sitl_mode').value
+        self.enable_rtl = self.get_parameter('enable_rtl_trigger').value
+        
+        # Simplified battery strategy parameters
+        self.battery_strategy = self.get_parameter('battery_strategy').value.lower()
+        self.reset_after_hours = self.get_parameter('reset_after_hours').value
+        self.always_reset = self.get_parameter('always_reset_battery').value
+        
+        # Validate battery strategy
+        valid_strategies = ['px4', 'integration', 'auto']
+        if self.battery_strategy not in valid_strategies:
+            self.get_logger().warn(f'Invalid battery_strategy: {self.battery_strategy}, using "integration"')
+            self.battery_strategy = 'integration'
+        
+        # Complete State Management
+        self.battery_status = None
+        self.vehicle_status = None
+        self.global_position = None
+        self.home_position = None
+        self.rtl_triggered = False
+        self.rtl_trigger_time = None
+        self.rtl_completed = False
+        self.lock = Lock()
+        self.node_start_time = time.time()
+        self.mission_start_time = None
+        self.armed_time = None
+        self.last_battery_log_time = 0
+        
+        # Battery integration state (simplified - engineer's approach)
+        self.discharged_mAh = 0.0
+        self.last_stamp = None  # Simple timestamp tracking
+        self.disarm_time = None
+        self.battery_source = "none"  # "integrated", "px4", or "none"
+        self._last_battery_source = "none"  # For logging source changes
+        
+        # Legacy battery state (for PX4 fallback)
+        self.battery_percentage = None
+        self.last_valid_px4_battery = None
+        
+        # Current monitoring (keeping existing for compatibility)
+        self.current_history = deque(maxlen=self.current_window_size)
+        self.sitl_default_current = 15.0
+        
+        # Command tracking
+        self.last_command_time = 0
+        self.pending_rtl_command = False
+        self.command_retry_count = 0
+        
+        # WIG effect tracking (for logging only)
+        self.in_wig_effect = False
+        self.wig_time_total = 0
+        self.wig_time_start = None
+        self.wig_efficiency_log = []  # Store efficiency values for analysis
+        self.current_h_over_b = None  # Current h/b ratio
+        self.current_wig_efficiency = 0.0  # Current efficiency gain
+        
+        # Mode tracking for debugging
+        self.mode_history = deque(maxlen=10)
+        self.previous_mode = None
+        
+        # QoS profile
+        px4_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            durability=DurabilityPolicy.VOLATILE
+        )
+        
+        # Publishers
+        self.vehicle_command_pub = self.create_publisher(
+            VehicleCommand,
+            '/fmu/in/vehicle_command',
+            px4_qos_profile
+        )
+        
+        # Status publisher for monitoring
+        self.status_pub = self.create_publisher(
+            String,
+            '/power_monitor/status',
+            10
+        )
+        
+        # Subscribers
+        self.create_subscription(BatteryStatus, '/fmu/out/battery_status', 
+                                self.battery_callback, qos_profile=px4_qos_profile)
+        self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status', 
+                                self.status_callback, qos_profile=px4_qos_profile)
+        self.create_subscription(VehicleCommandAck, '/fmu/out/vehicle_command_ack', 
+                                self.command_ack_callback, qos_profile=px4_qos_profile)
+        self.create_subscription(VehicleGlobalPosition, '/fmu/out/vehicle_global_position',
+                                self.gps_callback, qos_profile=px4_qos_profile)
+        
+        # Main timer
+        self.create_timer(self.check_interval, self.check_battery_status)
+        
+        # Status publisher timer (1Hz)
+        self.create_timer(1.0, self.publish_status)
+        
+        # Startup message
+        self.print_startup_info()
+    
+    def print_startup_info(self):
+        """Print comprehensive startup information"""
+        self.get_logger().info('='*60)
+        self.get_logger().info('POWER MONITOR FINAL - SIMPLIFIED VERSION')
+        self.get_logger().info('='*60)
+        self.get_logger().info(f'✈️ Fixed-Wing Configuration:')
+        self.get_logger().info(f'  • RTL Battery Threshold: {self.rtl_battery_remaining:.1f}%')
+        self.get_logger().info(f'  • Return Speed: {self.return_speed:.1f} m/s')
+        self.get_logger().info(f'  • Safety Margin: {self.safety_margin*100:.0f}%')
+        self.get_logger().info(f'  • Loiter Radius: {self.loiter_radius:.0f}m')
+        self.get_logger().info(f'🔋 Battery Strategy:')
+        self.get_logger().info(f'  • Strategy: {self.battery_strategy.upper()}')
+        self.get_logger().info(f'  • Battery Capacity: {self.battery_capacity:.0f} mAh')
+        if self.battery_strategy in ['integration', 'auto']:
+            self.get_logger().info(f'  • Reset Mode: {"ALWAYS" if self.always_reset else f"AFTER {self.reset_after_hours:.1f}H"}')
+            self.get_logger().info(f'  • Multi-Mission: Battery state preserved between flights')
+            self.get_logger().info(f'  • Method: Simple current integration (engineer\'s approach)')
+        if self.battery_strategy == 'px4':
+            self.get_logger().info(f'  • Source: Using PX4 battery estimator directly')
+        elif self.battery_strategy == 'integration':
+            self.get_logger().info(f'  • Source: Using current integration only')  
+        elif self.battery_strategy == 'auto':
+            self.get_logger().info(f'  • Source: Integration preferred, PX4 fallback')
+        self.get_logger().info(f'🌊 WIG Effect Parameters (Logging Only):')
+        self.get_logger().info(f'  • Wing Span: {self.wing_span:.1f}m')
+        self.get_logger().info(f'  • WIG Tracking Below: {self.wig_height_threshold:.1f}m')
+        self.get_logger().info(f'⏱️ Grace Periods:')
+        self.get_logger().info(f'  • Mission Start: {self.mission_start_grace:.0f}s')
+        self.get_logger().info(f'  • Min Flight Time: {self.min_flight_time:.0f}s')
+        self.get_logger().info('='*60)
+    
+    def calculate_wig_efficiency(self, altitude_agl):
+        """Calculate WIG efficiency - for LOGGING ONLY"""
+        if altitude_agl is None or altitude_agl < 0:
+            return 0.0
+        
+        h_over_b = altitude_agl / self.wing_span
+        
+        # Hyperbolic model parameters
+        K = 0.35  # Maximum 35% efficiency gain
+        n = 2.5   # Decay exponent
+        
+        if h_over_b < 2.0: 
+            efficiency_gain = K / (1 + (h_over_b ** n))
+            return efficiency_gain
+        else:
+            return 0.0
+    
+    def battery_callback(self, msg):
+        """Simple battery processing with current integration (engineer's approach)"""
+        with self.lock:
+            self.battery_status = msg
+            
+            # Extract current (engineer's approach)
+            current_A = msg.current_a if msg.current_a is not None and msg.current_a >= 0.0 else msg.current_average_a
+            
+            # Fallback for SITL if no current available
+            if current_A is None or current_A <= 0:
+                if self.sitl_mode:
+                    current_A = self.sitl_default_current
+                else:
+                    current_A = None
+            
+            # Simple current integration (engineer's approach)
+            if self.battery_strategy in ['integration', 'auto'] and self.is_armed():
+                self.update_simple_integration(current_A)
+            
+            # Keep current history for compatibility
+            if current_A is not None and current_A > 0:
+                self.current_history.append(current_A)
+            
+            # Handle PX4 battery percentage
+            self.update_px4_battery_percentage(msg)
+            
+            # Select battery source based on strategy
+            self.select_battery_source()
+    
+    def update_simple_integration(self, current_A):
+        """Simple current integration - engineer's approach"""
+        now = self.get_clock().now().nanoseconds / 1e9
+        
+        if self.last_stamp is not None and current_A is not None and current_A > 0:
+            dt = max(0.0, now - self.last_stamp)
+            self.discharged_mAh += current_A * (dt / 3600.0) * 1000.0  # A * h -> mAh
+            
+            # Clamp to capacity (can't discharge more than battery holds)
+            self.discharged_mAh = min(self.discharged_mAh, self.battery_capacity)
+            
+            # Debug logging (every 10 seconds)
+            if time.time() - self.last_battery_log_time > 10.0:
+                remaining_pct = max(0, (1.0 - self.discharged_mAh / self.battery_capacity) * 100)
+                self.get_logger().info(
+                    f'🔋 Integration: {self.discharged_mAh:.1f}/{self.battery_capacity:.0f} mAh used, '
+                    f'{remaining_pct:.1f}% remaining, Current: {current_A:.2f}A'
+                )
+                self.last_battery_log_time = time.time()
+        
+        self.last_stamp = now
+    
+    def update_px4_battery_percentage(self, msg):
+        """Update PX4 battery percentage (for fallback)"""
+        if hasattr(msg, 'remaining'):
+            new_percentage = None
+            
+            if 0 <= msg.remaining <= 1.0:
+                new_percentage = msg.remaining * 100.0
+            elif 1.0 < msg.remaining <= 100.0:
+                new_percentage = msg.remaining
+            
+            if new_percentage is not None and 0 <= new_percentage <= 100:
+                self.battery_percentage = new_percentage
+                self.last_valid_px4_battery = new_percentage
+    
+    def select_battery_source(self):
+        """Select battery source based on strategy"""
+        if self.battery_strategy == 'px4':
+            # Always use PX4 data
+            if self.battery_percentage is not None:
+                self.battery_source = "px4"
+            else:
+                self.battery_source = "none" 
+                
+        elif self.battery_strategy == 'integration':
+            # Always use integration (check if we have integration data)
+            if self.is_armed() and self.last_stamp is not None:
+                self.battery_source = "integrated"
+            else:
+                self.battery_source = "none"
+                
+        elif self.battery_strategy == 'auto':
+            # Use integration if available, fall back to PX4
+            if self.is_armed() and self.last_stamp is not None:
+                self.battery_source = "integrated"
+            elif self.battery_percentage is not None:
+                self.battery_source = "px4"
+            else:
+                self.battery_source = "none"
+        
+        # Log strategy changes
+        if hasattr(self, '_last_battery_source') and self._last_battery_source != self.battery_source:
+            self.get_logger().info(f'🔋 Battery source: {self._last_battery_source} → {self.battery_source}')
+        self._last_battery_source = self.battery_source
+    
+    def get_battery_percentage(self):
+        """Get current battery percentage from active source"""
+        if self.battery_source == "integrated":
+            # Calculate from discharged capacity
+            remaining = max(0, 1.0 - self.discharged_mAh / self.battery_capacity)
+            return remaining * 100.0
+        elif self.battery_source == "px4":
+            return self.battery_percentage
+        else:
+            return None
+    
+    def should_reset_battery_on_arm(self):
+        """Determine if battery integration should be reset"""
+        # Only applies to integration strategy
+        if self.battery_strategy not in ['integration', 'auto']:
+            return False
+            
+        # Always reset if configured
+        if self.always_reset:
+            return True
+        
+        # Reset if this is first arm (no previous discharge data)
+        if self.discharged_mAh == 0:
+            return True
+        
+        # Reset if disarmed for long time (assume battery swap/recharge)
+        if self.disarm_time is not None:
+            hours_since_disarm = (time.time() - self.disarm_time) / 3600.0
+            if hours_since_disarm >= self.reset_after_hours:
+                self.get_logger().info(f'🔋 Integration reset: {hours_since_disarm:.1f}h since disarm (>= {self.reset_after_hours:.1f}h)')
+                return True
+        
+        # Continue with previous battery state
+        current_pct = max(0, (1.0 - self.discharged_mAh / self.battery_capacity) * 100)
+        self.get_logger().info(f'🔋 Continuing integration: {current_pct:.1f}% ({self.discharged_mAh:.0f} mAh used)')
+        return False
+    
+    def gps_callback(self, msg):
+        """Process GPS with WIG effect detection"""
+        with self.lock:
+            self.global_position = msg
+            
+            # Set home position on first valid GPS after arming
+            if (self.home_position is None and 
+                self.is_armed() and
+                msg.lat != 0 and msg.lon != 0):
+                
+                self.home_position = (msg.lat, msg.lon, msg.alt)
+                self.get_logger().info(f'🏠 Home position set: lat={msg.lat:.6f}, lon={msg.lon:.6f}, alt={msg.alt:.2f}m')
+            
+            # WIG effect detection for logging
+            if self.is_armed() and hasattr(msg, 'alt'):
+                altitude_agl = self.get_altitude_agl()
+                
+                if altitude_agl is not None:
+                    self.current_h_over_b = altitude_agl / self.wing_span
+                    self.current_wig_efficiency = self.calculate_wig_efficiency(altitude_agl)
+                    
+                    # Track WIG zone entry/exit
+                    was_in_wig = self.in_wig_effect
+                    self.in_wig_effect = (altitude_agl <= self.wig_height_threshold and 
+                                         altitude_agl >= self.min_safe_alt and
+                                         self.current_wig_efficiency > 0.05)
+                    
+                    # Log WIG transitions
+                    if self.in_wig_effect and not was_in_wig:
+                        self.wig_time_start = time.time()
+                        self.get_logger().info(
+                            f'🌊 Entered WIG zone - Alt: {altitude_agl:.1f}m, '
+                            f'h/b: {self.current_h_over_b:.2f}, '
+                            f'Efficiency: +{self.current_wig_efficiency*100:.1f}% (INFO ONLY)'
+                        )
+                    elif not self.in_wig_effect and was_in_wig:
+                        if self.wig_time_start:
+                            session_time = time.time() - self.wig_time_start
+                            self.wig_time_total += session_time
+                            self.get_logger().info(f'☁️ Exited WIG zone - Session: {session_time:.1f}s')
+                        self.wig_efficiency_log = []
+                    
+                    if self.in_wig_effect:
+                        self.wig_efficiency_log.append(self.current_wig_efficiency)
+    
+    def status_callback(self, msg):
+        """Process vehicle status"""
+        with self.lock:
+            previous_mode = self.get_current_mode() if self.vehicle_status else None
+            previous_arming = self.vehicle_status.arming_state if self.vehicle_status else None
+            
+            self.vehicle_status = msg
+            current_mode = self.get_current_mode()
+            
+            # Track mode changes
+            if previous_mode != current_mode:
+                self.mode_history.append((time.time(), previous_mode, current_mode))
+                self.get_logger().info(f'✈️ Mode: {previous_mode} → {current_mode}')
+                
+                # Mission start detection
+                if current_mode in ['AUTO.MISSION', 'AUTO.TAKEOFF'] and \
+                   previous_mode not in ['AUTO.MISSION', 'AUTO.TAKEOFF', 'AUTO.LOITER']:
+                    self.mission_start_time = time.time()
+                    self.get_logger().info(f'🚀 Mission started - Grace period: {self.mission_start_grace}s')
+                
+                # RTL completion detection
+                if previous_mode == 'AUTO.RTL':
+                    if current_mode == 'AUTO.LOITER':
+                        self.handle_rtl_completion('LOITER')
+                    elif current_mode in ['AUTO.LAND', 'MANUAL']:
+                        self.handle_rtl_completion('LAND')
+                
+                # Mission resume detection
+                if self.rtl_triggered and current_mode in ['AUTO.MISSION']:
+                    self.handle_mission_resume()
+            
+            # Track arming state
+            if previous_arming != msg.arming_state:
+                if msg.arming_state == 2:  # ARMED
+                    self.handle_arm()
+                elif msg.arming_state == 1:  # DISARMED
+                    self.handle_disarm()
+    
+    def command_ack_callback(self, msg):
+        """Process command acknowledgments"""
+        with self.lock:
+            if self.pending_rtl_command:
+                if msg.command == VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH:
+                    if msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_ACCEPTED:
+                        self.get_logger().info('✅ RTL command ACCEPTED by PX4')
+                        self.rtl_triggered = True
+                        self.rtl_trigger_time = time.time()
+                        self.pending_rtl_command = False
+                        self.command_retry_count = 0
+                    elif msg.result == VehicleCommandAck.VEHICLE_CMD_RESULT_TEMPORARILY_REJECTED:
+                        self.get_logger().warn(f'⏳ RTL command TEMPORARILY REJECTED (retry {self.command_retry_count}/{self.max_retries})')
+                        self.pending_rtl_command = False
+                    else:
+                        self.get_logger().error(f'❌ RTL command FAILED: result={msg.result}')
+                        self.command_retry_count += 1
+                        self.pending_rtl_command = False
+                        
+                        if self.command_retry_count >= self.max_retries:
+                            self.get_logger().error('❌ Max RTL retries reached')
+                            self.rtl_triggered = True  # Prevent spam
+    
+    def get_current_mode(self):
+        """Get current flight mode"""
+        if not self.vehicle_status:
+            return "UNKNOWN"
+        
+        mode_map = {
+            0: "MANUAL", 1: "ALTITUDE", 2: "POSITION", 3: "AUTO.LOITER",
+            4: "AUTO.MISSION", 5: "AUTO.RTL", 6: "AUTO.LAND", 7: "AUTO.TAKEOFF",
+            8: "OFFBOARD", 9: "STABILIZED", 10: "ACRO", 11: "AUTO.LAND_ENGAGED",
+            12: "AUTO.PRECLAND", 13: "ORBIT", 14: "AUTO.VTOL_TAKEOFF"
+        }
+        
+        return mode_map.get(self.vehicle_status.nav_state, f"MODE_{self.vehicle_status.nav_state}")
+    
+    def is_armed(self):
+        if self.vehicle_status:
+            return self.vehicle_status.arming_state == 2
+        return False
+    
+    def is_failsafe_active(self):
+        if self.vehicle_status:
+            return self.vehicle_status.failsafe
+        return False
+    
+    def get_flight_time(self):
+        if self.armed_time is None:
+            return 0
+        return time.time() - self.armed_time
+    
+    def get_altitude_agl(self):
+        """Get altitude above ground level"""
+        if self.global_position and self.home_position:
+            return self.global_position.alt - self.home_position[2]
+        return None
+    
+    def is_in_grace_period(self):
+        """Check if in any grace period"""
+        current_time = time.time()
+        
+        # Mission start grace
+        if self.mission_start_time is not None:
+            time_since_mission = current_time - self.mission_start_time
+            if time_since_mission < self.mission_start_grace:
+                remaining = self.mission_start_grace - time_since_mission
+                self.get_logger().info(f'⏳ Mission grace: {remaining:.1f}s remaining')
+                return True
+        
+        # Min flight time
+        flight_time = self.get_flight_time()
+        if flight_time > 0 and flight_time < self.min_flight_time:
+            remaining = self.min_flight_time - flight_time
+            self.get_logger().info(f'⏳ Min flight time: {remaining:.1f}s remaining')
+            return True
+            
+        return False
+    
+    def calculate_distance_to_home(self):
+        """Calculate distance to home"""
+        if self.home_position is None or self.global_position is None:
+            return None
+        
+        lat1, lon1, alt1 = self.home_position
+        lat2 = self.global_position.lat
+        lon2 = self.global_position.lon
+        alt2 = self.global_position.alt
+        
+        # Haversine formula
+        R = 6371000
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        
+        a = math.sin(delta_phi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        
+        horizontal = R * c
+        vertical = abs(alt2 - alt1) * 0.3  # Reduced weight for fixed-wing
+        
+        return horizontal + 0.5*vertical
+    
+    def get_average_current(self):
+        """Get average current draw (for compatibility)"""
+        if not self.current_history:
+            return self.sitl_default_current if self.sitl_mode else None
+        return sum(self.current_history) / len(self.current_history)
+    
+    def calculate_remaining_time(self):
+        """Calculate battery time remaining - CONSERVATIVE"""
+        battery_pct = self.get_battery_percentage()
+        if battery_pct is None or battery_pct <= 0:
+            return None
+        
+        # Use average current from history
+        current_A = self.get_average_current()
+        
+        if current_A is None or current_A < self.min_current:
+            return None
+        
+        # Calculate remaining capacity
+        remaining_capacity = (battery_pct / 100.0) * self.battery_capacity
+        
+        # Convert current to mA and calculate time in hours, then seconds
+        current_mA = current_A * 1000.0
+        if current_mA > 0:
+            time_hours = remaining_capacity / current_mA
+            return time_hours * 3600.0
+        
+        return None
+    
+    def calculate_return_time(self):
+        """Calculate time needed to return home"""
+        distance = self.calculate_distance_to_home()
+        if distance is None:
+            return None
+        
+        # Base return time
+        base_time = distance / self.return_speed
+        
+        # Add loiter pattern time
+        loiter_time = (2 * math.pi * self.loiter_radius) / self.return_speed
+        
+        # Apply safety margin and buffer
+        total_time = (base_time + loiter_time) * (1 + self.safety_margin)
+        
+        return total_time + 120  # 2 minutes extra
+    
+    def send_rtl_command(self):
+        """Send RTL command"""
+        if time.time() - self.last_command_time < self.command_cooldown:
+            return False
+        
+        self.get_logger().warn('🚨 SENDING RTL COMMAND')
+        
+        msg = VehicleCommand()
+        msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+        msg.command = VehicleCommand.VEHICLE_CMD_NAV_RETURN_TO_LAUNCH
+        msg.param1 = 0.0
+        msg.param2 = 0.0
+        msg.param3 = 0.0
+        msg.param4 = 0.0
+        msg.param5 = 0.0
+        msg.param6 = 0.0
+        msg.param7 = 0.0
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        
+        self.vehicle_command_pub.publish(msg)
+        self.pending_rtl_command = True
+        self.last_command_time = time.time()
+        return True
+    
+    def handle_arm(self):
+        """Handle arming event"""
+        self.armed_time = time.time()
+        self.reset_rtl_state("Vehicle armed")
+        
+        # Handle battery strategy on arm
+        if self.should_reset_battery_on_arm():
+            self.reset_battery_integration("New flight")
+        else:
+            # Just reset timestamp for integration continuation
+            self.last_stamp = None
+        
+        self.wig_time_total = 0
+        self.wig_efficiency_log = []
+        self.get_logger().info('✈️ Vehicle ARMED - Power monitor active')
+    
+    def handle_disarm(self):
+        """Handle disarm event"""
+        self.disarm_time = time.time()
+        
+        # Log final battery status
+        battery_pct = self.get_battery_percentage()
+        if battery_pct is not None:
+            self.get_logger().info(f'🔋 Final battery: {battery_pct:.1f}% (source: {self.battery_source})')
+            if self.battery_source == "integrated":
+                self.get_logger().info(f'🔋 Total used: {self.discharged_mAh:.0f} mAh')
+                self.get_logger().info(f'🔋 Battery state preserved for next flight')
+        
+        # Log WIG statistics
+        if self.wig_time_total > 0:
+            self.get_logger().info('='*50)
+            self.get_logger().info('🌊 WIG Effect Summary (Informational):')
+            self.get_logger().info(f'  • Total WIG time: {self.wig_time_total:.1f}s')
+            flight_time = self.get_flight_time()
+            if flight_time > 0:
+                self.get_logger().info(f'  • Flight percentage: {(self.wig_time_total/flight_time)*100:.1f}%')
+            self.get_logger().info('='*50)
+        
+        # Stop integration but preserve battery state (simple approach)
+        self.last_stamp = None
+        
+        # Reset flight-specific state
+        self.armed_time = None
+        self.mission_start_time = None
+        self.home_position = None
+        self.rtl_triggered = False
+        self.get_logger().info('🛑 Vehicle DISARMED')
+    
+    def reset_battery_integration(self, reason):
+        """Reset battery integration to start fresh (simple approach)"""
+        self.discharged_mAh = 0.0
+        self.last_stamp = None
+        self.get_logger().info(f'🔋 Battery integration reset: {reason}')
+    
+    def handle_rtl_completion(self, end_mode):
+        """Handle RTL completion"""
+        self.get_logger().info(f'✅ RTL completed → {end_mode}')
+        self.rtl_completed = True
+        
+        if end_mode == 'LOITER':
+            self.get_logger().info(f'✈️ Loitering at home (radius: {self.loiter_radius}m)')
+    
+    def handle_mission_resume(self):
+        """Handle mission resume after RTL"""
+        self.get_logger().info('📍 Mission resumed after RTL')
+        self.reset_rtl_state("Mission resumed")
+        self.mission_start_time = time.time()
+    
+    def reset_rtl_state(self, reason):
+        """Reset RTL state"""
+        if self.rtl_triggered:
+            self.get_logger().info(f'🔄 Resetting RTL state: {reason}')
+        self.rtl_triggered = False
+        self.rtl_trigger_time = None
+        self.rtl_completed = False
+        self.command_retry_count = 0
+        self.pending_rtl_command = False
+    
+    def publish_status(self):
+        """Publish status for monitoring"""
+        with self.lock:
+            battery_pct = self.get_battery_percentage()
+            
+            status = {
+                'timestamp': time.time(),
+                'battery_pct': battery_pct,
+                'battery_source': self.battery_source,
+                'discharged_mah': self.discharged_mAh,
+                'current_avg': self.get_average_current(),
+                'time_remaining': self.calculate_remaining_time(),
+                'distance_home': self.calculate_distance_to_home(),
+                'return_time': self.calculate_return_time(),
+                'mode': self.get_current_mode(),
+                'armed': self.is_armed(),
+                'rtl_triggered': self.rtl_triggered,
+                'in_wig_effect': self.in_wig_effect,
+                'altitude_agl': self.get_altitude_agl(),
+                'flight_time': self.get_flight_time()
+            }
+            
+            msg = String()
+            msg.data = json.dumps(status)
+            self.status_pub.publish(msg)
+    
+    def check_battery_status(self):
+        """Main battery checking logic"""
+        with self.lock:
+            # Skip if not armed
+            if not self.is_armed():
+                return
+            
+            # Skip if RTL already triggered
+            if self.rtl_triggered:
+                if self.rtl_trigger_time:
+                    elapsed = time.time() - self.rtl_trigger_time
+                    if elapsed > self.rtl_reset_timeout:
+                        current_mode = self.get_current_mode()
+                        if current_mode not in ['AUTO.RTL', 'AUTO.LOITER', 'AUTO.LAND']:
+                            self.reset_rtl_state(f"RTL timeout ({elapsed:.0f}s)")
+                    else:
+                        return
+                else:
+                    return
+            
+            # Skip if in grace period
+            if self.is_in_grace_period():
+                return
+            
+            # Skip if failsafe active
+            if self.is_failsafe_active():
+                self.get_logger().debug('PX4 failsafe active - standing by')
+                return
+            
+            # Skip if already in safe mode
+            current_mode = self.get_current_mode()
+            if current_mode in ['AUTO.RTL', 'AUTO.LAND', 'MANUAL', 'AUTO.LAND_ENGAGED']:
+                return
+            
+            # Check prerequisites
+            battery_pct = self.get_battery_percentage()
+            if battery_pct is None:
+                self.get_logger().warn_throttle(10.0, '⚠️ No battery data available')
+                return
+            
+            if self.home_position is None:
+                elapsed = time.time() - self.node_start_time
+                if elapsed > self.home_timeout:
+                    self.get_logger().warn(f'⚠️ No home position after {self.home_timeout}s')
+                return
+            
+            # Calculate metrics
+            distance = self.calculate_distance_to_home()
+            remaining_time = self.calculate_remaining_time()
+            return_time = self.calculate_return_time()
+            altitude = self.get_altitude_agl()
+            current_A = self.get_average_current()
+            
+            # Build status log
+            log_parts = [
+                f'🔋 Battery: {battery_pct:.1f}% ({self.battery_source})',
+                f'📍 Mode: {current_mode}'
+            ]
+            
+            if distance:
+                log_parts.append(f'🏠 Distance: {distance:.1f}m')
+            
+            if remaining_time:
+                log_parts.append(f'⏱️ Time left: {remaining_time/60:.1f}min')
+            
+            if return_time:
+                log_parts.append(f'🔁 RTL needs: {return_time/60:.1f}min')
+            
+            if altitude:
+                log_parts.append(f'📏 Alt: {altitude:.1f}m')
+                if self.in_wig_effect:
+                    log_parts.append(f'🌊 WIG: h/b={self.current_h_over_b:.2f} (info only)')
+            
+            if current_A:
+                log_parts.append(f'⚡ Current: {current_A:.1f}A')
+            
+            self.get_logger().info(' | '.join(log_parts))
+            
+            # Check RTL conditions
+            should_rtl = False
+            reason = ""
+            
+            # Battery percentage check
+            if battery_pct <= self.rtl_battery_remaining:
+                should_rtl = True
+                reason = f"battery at threshold ({battery_pct:.1f}% ≤ {self.rtl_battery_remaining:.1f}%)"
+            
+            # Time remaining check
+            elif remaining_time and return_time and remaining_time < return_time:
+                should_rtl = True
+                reason = f"insufficient time ({remaining_time/60:.1f}min < {return_time/60:.1f}min needed)"
+            
+            # Trigger RTL if needed
+            if should_rtl and self.command_retry_count < self.max_retries:
+                self.get_logger().warn(f'⚠️ RTL NEEDED: {reason}')
+                if self.enable_rtl:
+                    if self.send_rtl_command():
+                        self.command_retry_count += 1
+                else:
+                    self.get_logger().info('RTL trigger disabled for testing')
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PowerMonitorFinal()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('Shutting down Power Monitor Final')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
